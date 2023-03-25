@@ -1,11 +1,12 @@
 import torch
 import torch.nn as nn
 import math
-from skimage.feature import canny
-from matplotlib import pyplot as plt
-from scipy.ndimage import gaussian_filter
-from skimage.filters import gaussian
-import timeit
+# from skimage.feature import canny
+# from matplotlib import pyplot as plt
+# from scipy.ndimage import gaussian_filter
+# from skimage.filters import gaussian
+# import timeit
+from utils import calculate_weight_matrix
 
 
 def per_class_dice_score(prediction, target, class_weight, smooth, no_class=None):
@@ -84,7 +85,7 @@ class DiceCELoss(nn.Module):
         dice = 0.
         ce_loss = 0.
 
-        self.ce_mat_weights_all = torch.zeros_like(y_true[:, 0, :, :])
+        self.ce_mat_weights_all = calculate_weight_matrix(y_true, self.edge_weight, self.area_weights)
         self.no_class_pixels = torch.sum(y_true, dim=1) == 0
         for c in range(self.n_classes):
             pred = y_pred[:, c, :, :].contiguous()
@@ -93,19 +94,15 @@ class DiceCELoss(nn.Module):
             if math.isnan(dice):
                 print('Dice loss is NAN!')
 
-            true = true.to(torch.int8)
-            batch_size = true.size()[0]
-            empty_row = torch.zeros(batch_size, 1, true.size()[2]).cuda()
-            edges_top = torch.sub(true[:, 1:, :], true[:, :-1, :]).clamp(0, 1)
-            edges_top = torch.cat((empty_row, edges_top), dim=1)
-            edges_bottom = torch.sub(true[:, :-1, :], true[:, 1:, :]).clamp(0, 1)
-            edges_bottom = torch.cat((edges_bottom, empty_row), dim=1)
-            edges = edges_top + edges_bottom
+        # TODO: add blurring weighing mask
+        # np.logspace(0.1, 1, num=10)
+        # self.ce_mat_weights_all[0, :, :] = torch.tensor(gaussian(self.ce_mat_weights_all[0, :, :].cpu(), sigma=3))
 
-            true_no_edges = true.clone()
-            true_no_edges[torch.gt(edges, 0)] = 0
-            matrix = torch.add(torch.mul(torch.gt(edges, 0), self.edge_weight), torch.mul(true_no_edges, self.area_weights[c]))
-            self.ce_mat_weights_all.add_(matrix)
+        # ax = plt.subplot(121)
+        # ax.imshow(torch.squeeze(self.ce_mat_weights_all.cpu()))
+        # ax = plt.subplot(122)
+        # ax.plot(self.ce_mat_weights_all[0, :, 192].cpu())
+        # plt.show()
 
         for c in range(self.n_classes):
             pred_ce = y_pred[:, c, :, :].contiguous().clamp(self.epsilon)
@@ -117,7 +114,6 @@ class DiceCELoss(nn.Module):
             else:
                 weight_matrix = self.ce_mat_weights_all
             ce_loss -= torch.mul(torch.mul(weight_matrix, true_ce), torch.log(pred_ce)).mean()
-            # second_term = (1 - true_ce) * torch.log(1 - pred_ce)
 
         if math.isnan(ce_loss):
             print('Cross entropy loss is NAN!')
@@ -169,14 +165,32 @@ class WeightedCrossEntropyLoss(nn.Module):
         else:
             self.class_weights = class_weights
         self.n_classes = nc
+        self.ce_mat_weights_all = torch.Tensor([])
+        self.no_class_pixels = torch.Tensor([])
+        self.edge_weight = 10
+        self.area_weights = (1, 5, 5, 1)
+        self.epsilon = 1e-15
 
     def forward(self, y_pred, y_true):
         activation_fn = nn.Softmax2d()
         y_pred = activation_fn(y_pred)
         ce_loss = 0.
+
+        self.ce_mat_weights_all = calculate_weight_matrix(y_true, self.edge_weight, self.area_weights) # torch.zeros_like(y_true[:, 0, :, :])
+        self.no_class_pixels = torch.sum(y_true, dim=1) == 0
+
         for c in range(self.n_classes):
-            pred = y_pred[:, c, :, :].contiguous()  # .view(-1)
-            true = y_true[:, c, :, :].contiguous()  # .view(-1)
-            ce_loss += self.class_weights[c] * (- true * torch.log(pred)).mean()
+            pred_ce = y_pred[:, c, :, :].contiguous().clamp(self.epsilon)
+            true_ce = y_true[:, c, :, :].contiguous()
+            if torch.sum(self.no_class_pixels) > 0:
+                weight_matrix = torch.masked_select(self.ce_mat_weights_all, ~self.no_class_pixels)
+                pred_ce = torch.masked_select(pred_ce, ~self.no_class_pixels)
+                true_ce = torch.masked_select(true_ce, ~self.no_class_pixels)
+            else:
+                weight_matrix = self.ce_mat_weights_all
+            ce_loss -= torch.mul(torch.mul(weight_matrix, true_ce), torch.log(pred_ce)).mean()
+
+        if math.isnan(ce_loss):
+            print('Cross entropy loss is NAN!')
 
         return ce_loss

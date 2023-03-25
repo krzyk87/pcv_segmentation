@@ -5,28 +5,28 @@ from pathlib import Path
 import json
 
 import scipy.ndimage.morphology
-import torchvision.utils
+# import torchvision.utils
 from lxml import etree
 from matplotlib import pyplot as plt
 import re
 from tifffile import imwrite
 import numpy as np
 import torch
-import torchvision.transforms.functional as func
+# import torchvision.transforms.functional as func
 from torchvision.transforms.functional import crop, to_tensor
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'
 import tensorflow
 
-import math
-from skimage.measure import label, regionprops
-from skimage.morphology import skeletonize, disk    # opening
+# import math
+# from skimage.measure import label, regionprops
+from skimage.morphology import disk    # opening, skeletonize
 from skimage import filters, feature
 from scipy import ndimage, optimize
 import pandas as pd
+# from pymorph import mmorph
 import kornia
 
 import random
-import heapq
 
 GT_FILE = Path("gt.json")
 GT_PATH = Path("mvri")
@@ -39,14 +39,10 @@ def encode_experiment_name(params):
     experiment_name = '_'.join((params['network'], params['experiment']))
     if params['anomalies'] is not None:
         str_list = params['anomalies'].split('.')
-        substr = str_list[0].replace('anomalies50', '')
+        substr = str_list[0].replace('anomalies50anon', '')
         experiment_name = '_'.join((experiment_name, substr))
-    if params['pretrained']:
-        experiment_name = '_'.join((experiment_name, 'pretrain'))
     if params['features'] != 64:
         experiment_name = '_'.join((experiment_name, str(params['features'])))
-    if ('line' in params.keys()) and (params['line']):
-        experiment_name = '_'.join((experiment_name, 'line'))
     if params['distance_map'] is not None:
         experiment_name = '_'.join((experiment_name, 'DM' + params['distance_map']))
     if params['augment'] is not None:
@@ -148,10 +144,6 @@ def one_hot_to_sum(matrix):
 #     return result
 
 
-def probability_to_line(prediction):
-    return prediction
-
-
 def crop_image(image, gt_image, fixed=True):
     image_height = image.size()[1]
     image_width = image.size()[2]
@@ -168,6 +160,29 @@ def crop_image(image, gt_image, fixed=True):
     cropped_image = crop(image, int(crop_y), int(crop_x), output_height, output_width)
     cropped_gt = crop(gt_image, int(crop_y), int(crop_x), output_height, output_width)
     return cropped_image, cropped_gt
+
+
+def calculate_weight_matrix(ground_truth, edge_weight, area_weights):
+    n_classes = ground_truth.size()[1]
+    ce_mat_weights_all = torch.zeros_like(ground_truth[:, 0, :, :])
+    for c in range(n_classes):
+        true = ground_truth[:, c, :, :].contiguous()
+        true = true.to(torch.int8)
+        batch_size = true.size()[0]
+        empty_row = torch.zeros(batch_size, 1, true.size()[2]).cuda()
+        edges_top = torch.sub(true[:, 1:, :], true[:, :-1, :]).clamp(0, 1)
+        edges_top = torch.cat((empty_row, edges_top), dim=1)
+        edges_bottom = torch.sub(true[:, :-1, :], true[:, 1:, :]).clamp(0, 1)
+        edges_bottom = torch.cat((edges_bottom, empty_row), dim=1)
+        edges = edges_top + edges_bottom
+
+        true_no_edges = true.clone()
+        true_no_edges[torch.gt(edges, 0)] = 0
+        matrix = torch.add(torch.mul(torch.gt(edges, 0), edge_weight),
+                           torch.mul(true_no_edges, area_weights[c]))
+        ce_mat_weights_all.add_(matrix)
+
+    return ce_mat_weights_all
 
 
 # ------------ scores
@@ -250,7 +265,11 @@ def mean_abs_error(gt, pred):
 
 def check_topology(pred):
     pred_sum = torch.unsqueeze(one_hot_to_sum(pred), 0)
-    pred_cor = torch.squeeze(pred_sum)
+    # diff = ((pred_sum[1:, :] - pred_sum[:-1, :]) < 0) & (pred_sum[1:, :] != 0)
+    disc_kernel = torch.Tensor(disk(3)).cuda()
+    pred_cor = kornia.morphology.opening(pred_sum, disc_kernel)
+    pred_cor = kornia.morphology.closing(pred_cor, disc_kernel)
+    pred_cor = torch.squeeze(pred_cor)
     diff_open = ((pred_cor[1:, :] - pred_cor[:-1, :]) < 0) & (pred_cor[1:, :] != 0)
     is_incorrect = 0
     if torch.sum(diff_open) > 0:
@@ -356,63 +375,49 @@ def save_acc(filename, acc_values):
 
 
 def get_prediction_lines(prediction):
-    pred_rpe = get_bottom_line(prediction[:, 3, :, :])
-    pred_ilm = get_bottom_line(prediction[:, 2, :, :], pred_rpe)
-    pred_pcv = get_bottom_line(prediction[:, 1, :, :], pred_ilm)
-    return pred_pcv, pred_ilm, pred_rpe
+    n_classes = prediction.size()[1]
+    lines = torch.zeros(n_classes-1, prediction.size()[3])
+    line = None
+    for c in range(n_classes-1, 0, -1):
+        line = get_bottom_line(prediction[:, c, :, :], line)
+        lines[c-1] = line
+    return lines    # pred_pcv, pred_ilm, pred_rpe
+
+
+def get_nth_key(dictionary, n=0):
+    if n < 0:
+        n += len(dictionary)
+    for i, key in enumerate(dictionary.keys()):
+        if i == n:
+            return key
+    raise IndexError("dictionary index out of range")
+
+
+def get_prediction_lines_dict(prediction, out_dict):
+    n_classes = prediction.size()[1]
+    line = None
+    for c in range(n_classes-1, 0, -1):
+        line = get_bottom_line(prediction[:, c, :, :], line)
+        out_dict[get_nth_key(out_dict, c-1)].append(line.tolist())
+    return out_dict
 
 
 def save_prediction_json(predictions, scan_path):
     print(f'Saving file: {scan_path}')
-    pred_pcv = predictions[0]
-    pred_ilm = predictions[1]
-    pred_rpe = predictions[2]
+    n_classes = predictions.size()[1]
     out_dict = {"PCV": [], "ILM": [], "OB_RPE": []}
-    for it in range(pred_pcv.size()[0]):
-        out_dict["PCV"].append(pred_pcv[it].tolist())
-        out_dict["ILM"].append(pred_ilm[it].tolist())
-        out_dict["OB_RPE"].append(pred_rpe[it].tolist())
+    for it in range(predictions.size()[0]):
+        for c in range(n_classes):
+            out_dict[get_nth_key(out_dict, c - 1)].append(predictions[it, c].tolist())
     pred_filename = scan_path + ".json"
     with open(pred_filename, "w+") as gt_outfile:
         gt_outfile.write(json.dumps(out_dict))
 
 
-def save_orientations(orientations, dataset):
-    print('Saving calculated orientations...')
-    out_dict = {"ID": [], "orientation": []}
-    for it in range(orientations.size()[0]):
-        out_dict["ID"].append(it)
-        out_dict["orientation"].append(orientations[it].tolist())
-    filename = "orientations_" + dataset + ".json"
-    with open(filename, "w+") as outfile:
-        outfile.write(json.dumps(out_dict))
-
-
-def save_center_mass(center_mass_table, dataset):
-    print('Saving calculated centers of mass...')
-    out_dict = {"ID": [], "mass_center": []}
-    for it, center in enumerate(center_mass_table):
-        out_dict["ID"].append(it)
-        out_dict["mass_center"].append(center.tolist())
-    filename = "mass_center_" + dataset + ".json"
-    with open(filename, "w+") as outfile:
-        outfile.write(json.dumps(out_dict))
-
-
-def read_orientations(dataset):
-    filename = "orientations_" + dataset + ".json"
-    with open(filename) as f:
-        data_dict = json.loads(f.read())
-    orientations = torch.Tensor(data_dict["orientation"])
-    return orientations
-
-
-def read_mass_centers(dataset):
-    filename = "mass_center_" + dataset + ".json"
-    with open(filename) as f:
-        data_dict = json.loads(f.read())
-    centers = torch.Tensor(data_dict["mass_center"])
-    return centers
+def save_pred_dict_json(pred_dict, scan_path):
+    pred_filename = scan_path + ".json"
+    with open(pred_filename, "w+") as gt_outfile:
+        gt_outfile.write(json.dumps(pred_dict))
 
 
 # -------------- visualize results
@@ -422,24 +427,44 @@ def visualize(img, prediction, ground_truth, corrected_prediction=None, scan_nam
     ax.imshow(img)
     ax.set_title("Image")
     ax = plt.subplot(142)
-    ax.imshow(ground_truth)
+    ax.imshow(ground_truth, cmap='gray')
     ax.set_title("Ground Truth")
     ax = plt.subplot(143)
-    ax.imshow(prediction)
+    img = ax.imshow(prediction)
+    # plt.colorbar(img, ax=ax)
     ax.set_title("Prediction")
     ax = plt.subplot(144)
     if corrected_prediction is not None:
         ax.imshow(corrected_prediction)
         ax.set_title("Corrected prediction")
     else:
-        ax.imshow(abs(ground_truth - prediction) > 1)
+        # ax.imshow(abs(ground_truth - prediction) > 1)
         # ax.imshow(ground_truth ^ prediction)
         ax.set_title("Error")
     plt.suptitle(scan_name)
+
     if save_to_file:
         return figure
     else:
         plt.show()
+
+
+def visualize_dm(img, dm):
+    min_val = torch.min(dm)
+    max_val = torch.max(dm)
+    print(f'Min: {min_val}, max: {max_val}')
+
+    # ax = plt.subplot(121)
+    # ax.imshow(img)
+    ax = plt.subplot()
+    im = ax.imshow(dm)  # , vmin=-5, vmax=5
+    # cax = plt.axes([0.85, 0.1, 0.075, 0.8])
+    plt.colorbar(im)
+    # ax.axes.get_xaxis().set_visible(False)
+    # ax.axes.get_yaxis().set_visible(False)
+    plt.axis('off')
+    plt.savefig("dm2NetPRcolor.png", bbox_inches='tight', dpi=300)
+    plt.show()
 
 
 def plot_to_image(figure):
@@ -458,6 +483,46 @@ def plot_to_image(figure):
     return image
 
 
+def plot_dice_boxplot(dice_table):
+    dice_table = torch.transpose(dice_table, 0, 1)
+    tick_pos = []
+    tick_val = []
+    if dice_table.size()[1] == 4:
+        tick_pos = [1, 2, 3, 4]
+        tick_val = ['Over PCV', 'PCV-ILM', 'ILM-RPE', 'Below RPE']
+    elif dice_table.size()[1] == 9:
+        tick_pos = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        tick_val = ['Over ILM', 'ILM-RNFL/GCL', 'GCL+IPL', 'INL', 'OPL', 'ONL', 'IS', 'OS+RPE', 'Below RPE']
+    elif dice_table.size()[1] == 10:
+        tick_pos = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        tick_val = ['Over PCV', 'PCV-ILM', 'ILM-RNFL/GCL', 'GCL+IPL', 'INL', 'OPL', 'ONL', 'IS', 'OS+RPE', 'Below RPE']
+    else:
+        tick_pos = [1, 2, 3]
+        tick_val = ['Over ILM', 'ILM-RPE', 'Below RPE']
+
+    plt.figure(1)
+    ax = plt.subplot(121)
+    ax.violinplot(np.array(dice_table), showmedians=True)
+    plt.xticks(tick_pos, tick_val)
+    plt.ylim(-0.05, 1.05)
+
+    ax = plt.subplot(122)
+    ax.boxplot(np.array(dice_table))
+    plt.xticks(tick_pos, tick_val)
+    plt.ylim(-0.05, 1.05)
+    plt.show()
+
+
+# save ground truth as grayscale image
+def save_gt_tiff(gt_path, img_path, gt_image):
+    scan_folder = os.path.join(gt_path, img_path.split(os.path.sep)[-2])
+    if not os.path.exists(scan_folder):
+        os.mkdir(scan_folder)
+    filename = os.path.join(scan_folder, img_path.split(os.path.sep)[-1])
+    imwrite(filename, gt_image.numpy())  # to do: change float32 to uint8 for space saving
+
+
+# merge image, ground truth, prediction and error into one matrix for visualization
 def image_grid(image, gt, pred):
     if image.size()[0] > 1:
         image = image[0]
@@ -486,80 +551,14 @@ def calculate_retina_orientation(retina_image):
     image_width = retina_image.size()[1]
     cut10 = int(image_width / 10)
     retina_blur = ndimage.gaussian_filter(retina_image[:, cut10:-cut10], sigma=3)
+    # fig, ax = plt.subplots()
     edge_map_h = filters.sobel_h(retina_blur)
+    # ax.imshow(edge_map_h, cmap=plt.cm.gray)
     edge_map_v = filters.sobel_v(retina_blur)
     angle = np.arctan2(edge_map_v, edge_map_h)
 
     orientation = -angle.mean() * 2
     return orientation  # *360/(2*np.pi)
-
-
-def plot_circ_distribution(orientations):
-    fig = plt.figure()
-    ax = fig.add_subplot(111, polar=True)
-    circular_hist(ax, orientations, bins=180, offset=np.pi / 2, density=False)  # Visualise by area of bins
-    plt.show()
-
-
-def circular_hist(ax, x, bins=16, density=True, offset=0, gaps=True):
-    """
-    Produce a circular histogram of angles on ax.
-
-    Parameters
-    ----------
-    ax : matplotlib.axes._subplots.PolarAxesSubplot
-        axis instance created with subplot_kw=dict(projection='polar').
-    x : array
-        Angles to plot, expected in units of radians.
-    bins : int, optional
-        Defines the number of equal-width bins in the range. The default is 16.
-    density : bool, optional
-        If True plot frequency proportional to area. If False plot frequency
-        proportional to radius. The default is True.
-    offset : float, optional
-        Sets the offset for the location of the 0 direction in units of
-        radians. The default is 0.
-    gaps : bool, optional
-        Whether to allow gaps between bins. When gaps = False the bins are
-        forced to partition the entire [-pi, pi] range. The default is True.
-
-    Returns
-    -------
-    n : array or list of arrays
-        The number of values in each bin.
-    bins : array
-        The edges of the bins.
-    patches : `.BarContainer` or list of a single `.Polygon`
-        Container of individual artists used to create the histogram
-        or list of such containers if there are multiple input datasets.
-    """
-
-    x = (x + np.pi) % (2 * np.pi) - np.pi  # Wrap angles to [-pi, pi)
-    if not gaps:  # Force bins to partition entire circle
-        bins = np.linspace(-np.pi, np.pi, num=bins + 1)
-    n, bins = np.histogram(x, bins=bins)  # Bin data and record counts
-    widths = np.diff(bins)  # Compute width of each bin
-
-    if density:  # By default plot frequency proportional to area
-        area = n / x.size  # Area to assign each bin
-        radius = (area / np.pi) ** .5  # Calculate corresponding bin radius
-    else:  # Otherwise plot frequency proportional to radius
-        radius = n
-
-    patches = ax.bar(bins[:-1], radius, zorder=1, align='edge', width=widths,  # Plot data on ax
-                     edgecolor='C0', fill=False, linewidth=1)
-    ax.set_theta_offset(offset)  # Set the direction of the zero angle
-    ax.set_thetamin(-90)
-    ax.set_thetamax(90)
-    ax.set_theta_zero_location("N")     # theta=0 at the top
-    ax.set_theta_direction(-1)          # theta increasing clockwise
-    ax.set_xlabel('Images')
-    ax.set_ylabel('Angle [deg]', rotation=0, loc="top")
-    ax.set_yticks([0, 5, 10, 15, 20])
-
-    if density:  # Remove ylabels for area plots (they are mostly obstructive)
-        ax.set_yticks([])
-    return n, bins, patches
 
 
 def find_mass_center(retina_image):
@@ -572,81 +571,14 @@ def find_mass_center(retina_image):
     return torch.tensor([cy, cx])
 
 
-def plot_mass_distribution(mass_centers):
-    fig, ax = plt.subplots()
-    y = mass_centers[:, 0]
-    x = mass_centers[:, 1]
-    ax.scatter(x, y, s=0.8)
-    ax.set_ylim((0, 640))
-    ax.set_xlim((0, 384))
-    ax.set_ylabel("Image row index")
-    ax.set_xlabel("Image column index")
-    ax.axes.invert_yaxis()
-    confidence_ellipse(x, y, ax, edgecolor='red')
-    x_mean = x.mean()
-    y_mean = y.mean()
-    ax.plot(x_mean, y_mean, '+r')
-    ax.set_aspect('equal')
-    plt.show()
-
-
-def confidence_ellipse(x, y, ax, n_std=2.5, edgecolor='none', **kwargs):
-    """
-    Create a plot of the covariance confidence ellipse of *x* and *y*.
-    Parameters
-    ----------
-    x, y : array-like, shape (n, )
-        Input data.
-    ax : matplotlib.axes.Axes
-        The axes object to draw the ellipse into.
-    n_std : float
-        The number of standard deviations to determine the ellipse's radiuses.
-    **kwargs
-        Forwarded to `~matplotlib.patches.Ellipse`
-    Returns
-    -------
-    matplotlib.patches.Ellipse
-    """
-    from matplotlib.patches import Ellipse
-    import matplotlib.transforms as transforms
-    if x.size() != y.size():
-        raise ValueError("x and y must be the same size")
-
-    cov = np.cov(x, y)
-    pearson = cov[0, 1] / np.sqrt(cov[0, 0] * cov[1, 1])
-    # Using a special case to obtain the eigenvalues of this two-dimensionl dataset.
-    ell_radius_x = np.sqrt(1 + pearson)
-    ell_radius_y = np.sqrt(1 - pearson)
-    ellipse = Ellipse((0, 0), width=ell_radius_x * 2, height=ell_radius_y * 2,
-                      edgecolor=edgecolor, fill=False, **kwargs)
-
-    # Calculating the stdandard deviation of x from the squareroot of the variance and multiplying
-    # with the given number of standard deviations.
-    scale_x = np.sqrt(cov[0, 0]) * n_std
-    mean_x = x.mean()
-
-    # calculating the stdandard deviation of y ...
-    scale_y = np.sqrt(cov[1, 1]) * n_std
-    mean_y = y.mean()
-
-    transf = transforms.Affine2D() \
-        .rotate_deg(45) \
-        .scale(scale_x, scale_y) \
-        .translate(mean_x, mean_y)
-
-    ellipse.set_transform(transf + ax.transData)
-    return ax.add_patch(ellipse)
-
-
-def second_deg_func(x, a, b, c):
-    return a*(x**2) + b*x + c
-
-
 def calculate_distance_map(image, method='BasicOrient', prediction=None):
     image_height = image.size()[1]
     image_width = image.size()[2]
     mass_center = torch.zeros(1, 2)
     distance_map = torch.zeros_like(image)
+    # fig = plt.figure(1)
+    # ax = plt.subplot(131)
+    # ax.imshow(torch.squeeze(image), cmap=plt.cm.gray)
 
     if method == 'BasicOrient':
         orientation = - calculate_retina_orientation(torch.squeeze(image))
@@ -665,53 +597,40 @@ def calculate_distance_map(image, method='BasicOrient', prediction=None):
         top_value = torch.min(distance_map[:, 0, :])
         distance_map -= top_value
         distance_map /= torch.max(distance_map)
+        # ax = plt.subplot(142)
+        # ax.imshow(torch.squeeze(distance_map), cmap=plt.cm.gray)
     elif method == 'CumSum':
         image = (image - torch.min(image)) / (torch.max(image) - torch.min(image))
-        cs = np.cumsum(image, axis=1)\
+        cs = np.cumsum(image, axis=1)
+        # ax = plt.subplot(142)
+        # ax.imshow(torch.squeeze(cs), cmap=plt.cm.gray)
+
         smoothed = ndimage.gaussian_filter(cs, sigma=20)
         smoothed = to_tensor(np.transpose(smoothed, (1, 2, 0)))
+        # ax = plt.subplot(142)
+        # ax.imshow(torch.squeeze(smoothed), cmap=plt.cm.gray)
+
         scaled = (smoothed - 5) / 25.0
+        # ax = plt.subplot(143)
+        # ax.imshow(torch.squeeze(scaled), cmap=plt.cm.gray)
+
+        # clamped = torch.clamp(scaled, 0, 1)
+        # ax = plt.subplot(144)
+        # ax.imshow(torch.squeeze(clamped), cmap=plt.cm.gray)
+        # plt.show()
         distance_map = scaled
-    elif method == 'CannyEdge':
-        edges = feature.canny(torch.squeeze(image).numpy(), sigma=5)
-
-        xdata = torch.tensor(range(image_width))
-        ilm = get_top_line(to_tensor(edges).int(), upper_line=None)    # torch.argmax(torch.squeeze(to_tensor(edges)).int(), dim=0)
-        xdata2 = []
-        ilm2 = []
-        for x in range(image_width):
-            if ilm[x] != 0:
-                xdata2.append(x)
-                ilm2.append(ilm[x])
-        popt, pcov = optimize.curve_fit(second_deg_func, xdata2, ilm2)
-        ilm_final = second_deg_func(xdata, *popt)
-
-        edges[ilm, xdata] = False
-        edges[ilm+1, xdata] = False
-        rpe = get_top_line(to_tensor(edges).int(), upper_line=None)
-        xdata2 = []
-        rpe2 = []
-        for x in range(image_width):
-            if rpe[x] != 0:
-                xdata2.append(x)
-                rpe2.append(rpe[x])
-        popt, pcov = optimize.curve_fit(second_deg_func, xdata2, rpe2)
-        rpe_final = second_deg_func(xdata, *popt)
-
-        distance_map = torch.zeros_like(image)
-        ilm_final = ilm_final.int()
-        rpe_final = rpe_final.int()
-        for x in range(image_width):
-            retina_distance = rpe_final[x] - ilm_final[x]
-            distance_map[:, :ilm_final[x]+1, x] = - torch.flip(torch.range(ilm_final[x]) / retina_distance, dims=[0,])
-            distance_map[:, ilm_final[x]:rpe_final[x], x] = torch.from_numpy(np.linspace(0, 1, retina_distance))
-            distance_map[:, (rpe_final[x]-1):, x] = (torch.range(rpe_final[x], image_height) - ilm_final[x]) / retina_distance
     elif method == '2NetR':
         pred_rpe = get_bottom_line(prediction[:, 3, :, :])
         pred_ilm = get_bottom_line(prediction[:, 2, :, :], pred_rpe)
         retina_distance = pred_rpe - pred_ilm
         for x in range(image_width):
             distance_map[:, :, x] = (torch.arange(end=image_height, device=prediction.device) - pred_ilm[x]) / retina_distance[x]
+        # ax = plt.subplot(132)
+        # ax.imshow(torch.squeeze(distance_map), cmap=plt.cm.gray)
+        # clamped = torch.clamp(distance_map, 0, 1)
+        # ax = plt.subplot(133)
+        # ax.imshow(torch.squeeze(clamped), cmap=plt.cm.gray)
+        # plt.show()
     elif method == '2NetPR':
         rpe = get_bottom_line(prediction[:, 3, :, :])
         ilm = get_bottom_line(prediction[:, 2, :, :], rpe)
@@ -724,6 +643,12 @@ def calculate_distance_map(image, method='BasicOrient', prediction=None):
             distance_map[:, pcv[x]:ilm[x], x] = 1/2 * (torch.arange(pcv[x], ilm[x], device=prediction.device) - pcv[x]) / pcv_ilm[x]
             distance_map[:, ilm[x]:rpe[x], x] = 1/2 * ((torch.arange(ilm[x], rpe[x], device=prediction.device) - ilm[x]) / ilm_rpe[x] + 1)
             distance_map[:, rpe[x]:, x] = (torch.arange(rpe[x], image_height, device=prediction.device) - pcv[x]) / pcv_rpe[x]
+        # ax = plt.subplot(132)
+        # ax.imshow(torch.squeeze(distance_map), cmap=plt.cm.gray)
+        # clamped = torch.clamp(distance_map, 0, 1)
+        # ax = plt.subplot(133)
+        # ax.imshow(torch.squeeze(clamped), cmap=plt.cm.gray)
+        # plt.show()
 
     return distance_map.to(torch.float32)
 
@@ -744,9 +669,21 @@ def remove_anomalous(image_list, anomaly_file):
         image_path = os.path.join(folder_path, scan_name, 'Skan_nr_' + str(cross_section) + '.tiff')
         if image_path in image_list:
             image_list.remove(image_path)
+        # indices = [i for i, s in enumerate(image_list) if image_path in s]
+        # image_list.pop(indices)
     return image_list
 
 
+# a function to test individual methods from this file
 if __name__ == '__main__':
-    summary_kernel_box_plot('results/unet_kernel_dice1.csv')
+    dice_table = torch.zeros((4, 390))
+    with open('saved_model/dice.csv', 'r') as f:
+        reader = csv.reader(f)
+        next(reader)
+        it = 0
+        for row in reader:
+            next_row = torch.Tensor([float(row[0]), float(row[1]), float(row[2]), float(row[3])])
+            dice_table[:, it] = next_row
+            it += 1
+    plot_dice_boxplot(dice_table)
     pass

@@ -1,0 +1,54 @@
+--------- TENSORBOARD
+tensorboard --logdir=tb_logs
+
+-- COPY FILES (linux)
+scp vmtsegmentation/file_name.ext username@server.address.uk:/home/username/path/to/folder/file_name.ext
+
+--------- CONDA
+# download anaconda (change version if you want)
+wget https://repo.anaconda.com/archive/Anaconda3-2021.05-Linux-x86_64.sh
+
+# run the installer (Linux)
+bash Anaconda3-2021.05-Linux-x86_64.sh
+
+# so changes in your path take place in you current session:
+. ~/.bashrc         (lub source ~/.bashrc) - bedac w /home/agnieszka/
+# if not working:
+. ~/anaconda3/etc/profile.c/conda.sh
+
+# po zalogowaniu (jeśli bash nie uruchamia się automatycznie):
+bash <- zeby uruchomic basha
+
+# create environment
+conda create -n octseg python=3.7
+conda activate octseg
+
+# list environments
+conda info --envs
+# list packages installed in an active environment
+conda list
+
+--------- NVIDIA CUDA
+NVIDIA recommends using CUDA 11.1 or newer with RTX 3xxx series GPUs.
+(PUT: Razer Core with NVIDIA GeForce RTX 3070) --> installed CUDA 11.7
+(Karpik: NVIDIA GeForce GTX 970) --> installed CUDA 11.1
+(Dell: NVIDIA GeForce GTX 960M) --> old CUDA 11.0
+
+--------- install necessary libraries
+conda install pytorch==1.9.0 torchvision==0.10.0 torchaudio cudatoolkit=11.1 -c pytorch -c nvidia -c conda-forge
+pip install -r requirements.txt
+
+--------- SCREEN (Linux)
+# create screen
+screen -S session_name
+Ctrl+a c  --> Create a new window (with shell)
+Ctrl+a 0 --> Switch to window 0 (by number)
+
+# detach 
+Ctrl+a d
+
+# reatach
+screen -r (ID)
+
+# list screens
+screen -ls
