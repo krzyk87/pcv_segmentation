@@ -18,16 +18,16 @@ from utils import encode_experiment_name, find_best_model
 # learning parameters
 params_train = {
     'LEARNING_RATE': 0.000005,
-    'network': 'ReLayNet',   # UNetOrg / LFUNet / AttUNet / DRUNet / ReLayNet / FCN8s
-    'kernel': (3, 3),       # (3, 3) / (7, 3) / ...
+    'network': 'UNetOrg',   # UNetOrg / LFUNet / AttUNet / DRUNet / ReLayNet / FCN8s
+    'kernel': (7, 3),       # (3, 3) / (7, 3) / ...
     'features': 32,         # 16 / 32 / 64
-    'augment': None,        # (["FlipH", "Translate", "Rotate", "CropRandom"])  # "CropFixed"
+    'augment': ["FlipH", "Translate", "Rotate", "CropRandom"],        # (["FlipH", "Translate", "Rotate", "CropRandom"])  # "CropFixed"
     'distance_map': None,   # 'BasicOrient' / 'CumSum' / '2NetR' / '2NetPR'
     'batch': 1,             # if data augmentation is used -> batch must be 1, otherwise can be bigger
-    'N_CLASSES': 4,         # to how many segments the OCT image is divided (1 more than searched borders)
-    'anomalies': None    # "anomalies50anona3.csv"      # remove anomalous samples listed in .csv file from the dataset
+    'N_CLASSES': 10,        # to how many segments the OCT image is divided (1 more than searched borders)
+    'anomalies': "anomalies50anona3.csv"    # "anomalies50anona3.csv"      # remove anomalous samples listed in .csv file from the dataset
 }
-params_train['experiment'] = 'k' + str(params_train['kernel'][0]) + str(params_train['kernel'][1])
+params_train['experiment'] = 'k' + str(params_train['kernel'][0]) + str(params_train['kernel'][1]) + '_nc10'
 
 experiment_name, version_name, save_model_path = encode_experiment_name(params_train)
 if not os.path.exists(save_model_path):
@@ -64,8 +64,8 @@ if __name__ == '__main__':
     model_checkpoint = ModelCheckpoint(save_model_path, filename='{epoch}-{val_loss:.4f}')
         # log results of each epoch  with TensorBoard
     tensorboard_logger = TensorBoardLogger('tb_logs', name=experiment_name, version=version_name)   # log_graph=True
-    trainer = pl.Trainer(gpus=1, callbacks=[early_stopping, model_checkpoint], logger=tensorboard_logger, min_epochs=1,
-                         resume_from_checkpoint=find_best_model(save_model_path), max_epochs=1)
+    trainer = pl.Trainer(gpus=1, callbacks=[early_stopping, model_checkpoint], logger=tensorboard_logger, min_epochs=30,
+                         resume_from_checkpoint=find_best_model(save_model_path), max_epochs=100)
 
     # start model training
     trainer.fit(segment_model, training_dataloader, val_dataloader)

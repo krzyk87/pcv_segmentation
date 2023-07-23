@@ -92,17 +92,36 @@ class PcvDataset(Dataset):
         gt_image = np.zeros((nc, image.shape[0], image.shape[1]), dtype=np.uint8)
         ilm = gt.get("ILM")[scan_number]
         rpe = gt.get("OB_RPE")[scan_number]
-        if nc == 4:
+        if (nc == 4) or (nc == 10):
             pcv = gt.get("PCV")[scan_number]
+        if nc > 8:
+            rnfl_gcl = gt.get("RNFL-GCL")[scan_number]
+            ipl_inl = gt.get("IPL-INL")[scan_number]
+            inl_opl = gt.get("INL-OPL")[scan_number]
+            opl_onl = gt.get("OPL-HFL")[scan_number]
+            bmeis = gt.get("BMEIS")[scan_number]
+            is_os = gt.get("IS/OSJ")[scan_number]
         for x, yILM in enumerate(ilm):
             yRPE = rpe[x]
-            if nc == 3:
-                gt_image[:, :, x] = self.assign_region(nc, (yILM, yRPE), gt_image[:, :, x])
-            elif nc == 4:
+            if (nc == 4) or (nc == 10):
                 yPCV = pcv[x]
                 if yPCV > yILM:
                     yPCV = yILM
+            if nc >= 9:
+                yNFLGCL = rnfl_gcl[x]
+                yIPLINL = ipl_inl[x]
+                yINLOPL = inl_opl[x]
+                yOPLONL = opl_onl[x]
+                yBMEIS = bmeis[x]
+                yISOS = is_os[x]
+            if nc == 3:
+                gt_image[:, :, x] = self.assign_region(nc, (yILM, yRPE), gt_image[:, :, x])
+            elif nc == 4:
                 gt_image[:, :, x] = self.assign_region(nc, (yPCV, yILM, yRPE), gt_image[:, :, x])
+            elif nc == 9:
+                gt_image[:, :, x] = self.assign_region(nc, (yILM, yNFLGCL, yIPLINL, yINLOPL, yOPLONL, yBMEIS, yISOS, yRPE), gt_image[:, :, x])
+            elif nc == 10:
+                gt_image[:, :, x] = self.assign_region(nc, (yPCV, yILM, yNFLGCL, yIPLINL, yINLOPL, yOPLONL, yBMEIS, yISOS, yRPE), gt_image[:, :, x])
         return gt_image
 
     # get sample (image, ground truth, image_path)

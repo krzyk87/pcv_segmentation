@@ -22,6 +22,8 @@ weights_3 = torch.tensor([0.2, 1.0, 0.6, 0.23])
 weights_4 = torch.tensor([1.0, 2.6, 2.0, 1.1])
 weights_5 = torch.tensor([1.0, 4.9, 2.8, 1.1])
 weights_5a = torch.tensor([0.1, 0.5, 0.29, 0.11])
+weights_5a9c = torch.tensor([0.0044, 0.0927, 0.0765, 0.1966, 0.1505, 0.0619, 0.3292, 0.0825, 0.0058])
+weights_5a10c = torch.tensor([0.0033, 0.2524, 0.0827, 0.0665, 0.1466, 0.1005, 0.0419, 0.2292, 0.0725, 0.0044])
 
 
 # an overloaded custom Pytorch Lightning model
@@ -69,6 +71,10 @@ class LitUnet(pl.LightningModule):
         class_weights = torch.ones(self.n_classes)
         if self.n_classes == 4:
             class_weights = weights_5a
+        elif self.n_classes == 9:
+            class_weights = weights_5a9c
+        elif self.n_classes == 10:
+            class_weights = weights_5a10c
 
         # setup loss and training parameters
         # self.criterion = DiceLoss(weight=class_weights)
